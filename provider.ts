@@ -93,6 +93,7 @@ declare interface FetchResponse {
 }
 
 declare function fetch(url: string, options?: FetchOptions): Promise<FetchResponse>;
+declare const Buffer: any;
 
 interface RareLink {
   name: string;
@@ -724,6 +725,93 @@ class Provider {
     return match ? parseInt(match[1], 10) : 0;
   }
 
+  private archiveLinks(html: string, baseUrl: string): RareLink[] {
+    const links: RareLink[] = [];
+    const seen: Record<string, boolean> = {};
+    const anchor = /<a\b[^>]*href=["']([^"']+)["'][^>]*>([\s\S]*?)<\/a>/gi;
+    let match: RegExpExecArray | null;
+
+    while ((match = anchor.exec(html)) !== null) {
+      const url = this.absoluteUrl(match[1], baseUrl);
+      if (
+        !/^https?:\/\//i.test(url) ||
+        seen[url] ||
+        !/codedew\.com\/(?:zipper|zipcloud|streambeta|watchbeta)\//i.test(url)
+      ) {
+        continue;
+      }
+
+      const label = this.stripTags(match[2]) || "Watch";
+      seen[url] = true;
+      links.push({
+        name: this.normalizeServerName(label, url),
+        url,
+      });
+    }
+
+    return links;
+  }
+
+  private archiveEpisodes(
+    html: string,
+    pageUrl: string,
+    offset: number,
+    expectedCount: number = 0,
+  ): EpisodeDetails[] {
+    const links = this.archiveLinks(html, pageUrl);
+    if (!links.length) return [];
+
+    // The store.animetoonhindi archive pages used by RareAnimes normally
+    // contain one codedew link per episode in episode order. Prefer explicit
+    // episode numbers from labels; otherwise use the stable document order.
+    const numbered: Record<number, RareLink[]> = {};
+    const unnumbered: RareLink[] = [];
+
+    for (const link of links) {
+      const numberMatch = (link.name + " " + link.url.replace(/[-_]+/g, " "))
+        .match(/\b(?:episode|ep|e)\s*0*(\d{1,4})\b/i);
+
+      if (numberMatch) {
+        const number = parseInt(numberMatch[1], 10);
+        if (!numbered[number]) numbered[number] = [];
+        numbered[number].push(link);
+      } else {
+        unnumbered.push(link);
+      }
+    }
+
+    const explicit = Object.keys(numbered)
+      .map((key) => parseInt(key, 10))
+      .filter((number) => number > 0)
+      .sort((a, b) => a - b);
+
+    if (explicit.length) {
+      const episodes = explicit.map((local) =>
+        this.episodePayload(pageUrl, offset + local, local, "", numbered[local], false)
+      );
+      if (!expectedCount || episodes.length === expectedCount) return episodes;
+    }
+
+    if (expectedCount > 0 && unnumbered.length >= expectedCount) {
+      return unnumbered.slice(0, expectedCount).map((link, index) => {
+        const local = index + 1;
+        return this.episodePayload(pageUrl, offset + local, local, "", [link], false);
+      });
+    }
+
+    // If the archive contains more than one codedew link but the site did not
+    // expose a reliable count, ordinal mapping is still safer than treating
+    // navigation text as episodes.
+    if (!expectedCount && unnumbered.length > 1) {
+      return unnumbered.map((link, index) => {
+        const local = index + 1;
+        return this.episodePayload(pageUrl, offset + local, local, "", [link], false);
+      });
+    }
+
+    return [];
+  }
+
   private async episodesFromIndex(
     indexUrl: string,
     referer: string,
@@ -747,11 +835,10 @@ class Provider {
       if (!episodes.length) {
         episodes = this.extractEpisodeAnchors(html, finalUrl, offset);
       }
+      if (!episodes.length) {
+        episodes = this.archiveEpisodes(html, finalUrl, offset, expectedCount);
+      }
 
-      // A season page that declares 26 episodes must not be replaced by a
-      // single accidental match from an unrelated index page. If an external
-      // index does not yield a credible full list, fall back to placeholders
-      // 1..N using the original season-level links.
       if (expectedCount > 1 && episodes.length > 0 && episodes.length !== expectedCount) {
         console.log(
           "RareAnime: rejected incomplete index list count=" + episodes.length +
@@ -968,7 +1055,241 @@ class Provider {
     return urls.slice(0, 20);
   }
 
+  private queryParam(url: string, key: string): string {
+    const query = url.split("?")[1]?.split("#")[0] || "";
+    for (const part of query.split("&")) {
+      const index = part.indexOf("=");
+      const rawKey = index >= 0 ? part.slice(0, index) : part;
+      const rawValue = index >= 0 ? part.slice(index + 1) : "";
+      if (decodeURIComponent(rawKey) === key) {
+        try {
+          return decodeURIComponent(rawValue.replace(/\+/g, " "));
+        } catch (_error) {
+          return rawValue;
+        }
+      }
+    }
+    return "";
+  }
+
+  private async manualRequest(url: string, referer?: string): Promise<FetchResponse> {
+    return fetch(url, {
+      headers: {
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "User-Agent": USER_AGENT,
+        ...(referer ? { Referer: referer } : {}),
+      },
+      redirect: "manual",
+      timeout: 30,
+    });
+  }
+
+  private juicyBlob(html: string): string | null {
+    const call = html.match(/_juicycodes\(([\s\S]*?)\);?/i);
+    if (!call) return null;
+
+    const parts: string[] = [];
+    const stringPart = /"([^"]*)"/g;
+    let match: RegExpExecArray | null;
+    while ((match = stringPart.exec(call[1])) !== null) parts.push(match[1]);
+    return parts.length ? parts.join("") : null;
+  }
+
+  private decodeJuicy(blob: string): string {
+    if (blob.length <= 3) throw new Error("RareAnime: JuicyCodes blob is too short");
+
+    const tail = blob.slice(-3);
+    let saltText = "";
+    for (let i = 0; i < tail.length; i++) {
+      saltText += String(tail.charCodeAt(i) - 100);
+    }
+    const salt = parseInt(saltText, 10);
+
+    let body = blob.slice(0, -3).replace(/_/g, "+").replace(/-/g, "/");
+    while (body.length % 4 !== 0) body += "=";
+
+    const decoded = Buffer.from(body, "base64").toString("latin1");
+    const symbols = ["\x60", "%", "-", "+", "*", "$", "!", "_", "^", "="];
+    let digits = "";
+
+    for (let i = 0; i < decoded.length; i++) {
+      const index = symbols.indexOf(decoded.charAt(i));
+      if (index < 0) {
+        throw new Error("RareAnime: unexpected JuicyCodes symbol");
+      }
+      digits += String(index);
+    }
+
+    if (digits.length % 4 !== 0) {
+      throw new Error("RareAnime: JuicyCodes stream is misaligned");
+    }
+
+    let output = "";
+    for (let i = 0; i < digits.length; i += 4) {
+      output += String.fromCharCode((parseInt(digits.slice(i, i + 4), 10) % 1000) - salt);
+    }
+    return output;
+  }
+
+  private async resolveArgon(code: string): Promise<{ url: string; referer: string }> {
+    const embedUrl = "https://argon.razorshell.space/embed/" + encodeURIComponent(code);
+    const response = await fetch(embedUrl, {
+      headers: {
+        Accept: "text/html,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        Referer: "https://codedew.com/",
+        "User-Agent": USER_AGENT,
+      },
+      redirect: "follow",
+      timeout: 30,
+    });
+
+    if (!response.ok) {
+      throw new Error("RareAnime: Argon returned HTTP " + response.status);
+    }
+
+    const html = await Promise.resolve(response.text());
+    const blob = this.juicyBlob(html);
+    if (!blob) {
+      const direct = this.extractDirectMedia(html, embedUrl);
+      if (direct.length) return { url: direct[0], referer: "https://argon.razorshell.space/" };
+      throw new Error("RareAnime: Argon embed has no JuicyCodes payload");
+    }
+
+    const decoded = this.decodeJuicy(blob);
+    const hlsMatch = decoded.match(/["']file["']\s*:\s*["']([^"']+\.m3u8(?:\?[^"']*)?)["']/i);
+    if (!hlsMatch) throw new Error("RareAnime: Argon config has no HLS source");
+
+    return {
+      url: hlsMatch[1].replace(/\\\//g, "/"),
+      referer: "https://argon.razorshell.space/",
+    };
+  }
+
+  private async resolveStreamBeta(id: string): Promise<{ url: string; referer: string }> {
+    const pageUrl = "https://codedew.com/streambeta/?url=" + encodeURIComponent(id);
+    const response = await this.request(pageUrl, "https://codedew.com/");
+    const html = await Promise.resolve(response.text());
+    const match = html.match(/playerSources\s*=\s*(\[[\s\S]*?\])\s*;/i);
+    if (!match) throw new Error("RareAnime: StreamBeta has no playerSources");
+
+    let sources: any[] = [];
+    try {
+      sources = JSON.parse(match[1]);
+    } catch (_error) {
+      throw new Error("RareAnime: StreamBeta sources could not be decoded");
+    }
+
+    for (const source of sources) {
+      const stream = typeof source?.streamUrl === "string" ? source.streamUrl : "";
+      if (/^https?:\/\//i.test(stream)) {
+        return { url: stream, referer: pageUrl };
+      }
+
+      const download = typeof source?.url === "string" ? source.url : "";
+      const pd = download.match(/pixeldrain\.(?:net|dev)\/u\/([A-Za-z0-9]+)/i);
+      if (pd) {
+        return {
+          url: "https://pixeldrain.net/api/file/" + pd[1],
+          referer: "https://pixeldrain.net/",
+        };
+      }
+      if (/^https?:\/\//i.test(download) && !/mega\.(?:nz|io)/i.test(download)) {
+        return { url: download, referer: pageUrl };
+      }
+    }
+
+    throw new Error("RareAnime: StreamBeta has no direct source");
+  }
+
+  private async resolveCodedew(startUrl: string, referer: string): Promise<{ url: string; referer: string }> {
+    let current = this.decodeHtml(startUrl).replace(/&amp;/g, "&");
+    let currentReferer = referer || "https://codedew.com/";
+
+    for (let hop = 0; hop < 10; hop++) {
+      const directType = this.mediaType(current);
+      if (directType !== "unknown") return { url: current, referer: currentReferer };
+
+      if (/codedew\.com\/multiquality\//i.test(current)) {
+        const code = this.queryParam(current, "url");
+        if (!code) throw new Error("RareAnime: MultiQuality URL has no id");
+        return this.resolveArgon(code);
+      }
+
+      if (/codedew\.com\/streambeta\//i.test(current)) {
+        const id = this.queryParam(current, "url");
+        if (!id) throw new Error("RareAnime: StreamBeta URL has no id");
+        return this.resolveStreamBeta(id);
+      }
+
+      if (/codedew\.com\/watchbeta\//i.test(current)) {
+        const id = this.queryParam(current, "url");
+        if (!id) throw new Error("RareAnime: WatchBeta URL has no id");
+        return {
+          url: "https://pixeldrain.net/api/file/" + encodeURIComponent(id),
+          referer: "https://pixeldrain.net/",
+        };
+      }
+
+      const argon = current.match(/argon\.razorshell\.space\/embed\/([A-Za-z0-9]+)/i);
+      if (argon) return this.resolveArgon(argon[1]);
+
+      const response = await this.manualRequest(current, currentReferer);
+      const status = response.status;
+
+      if (status >= 300 && status < 400) {
+        const location = response.headers?.["location"] || response.headers?.["Location"] || "";
+        if (!location) throw new Error("RareAnime: codedew redirect has no Location");
+        const next = this.absoluteUrl(this.decodeHtml(location), current);
+        currentReferer = current;
+        current = next;
+        continue;
+      }
+
+      if (status < 200 || status >= 300) {
+        throw new Error("RareAnime: codedew returned HTTP " + status);
+      }
+
+      const html = await Promise.resolve(response.text());
+      const direct = this.extractDirectMedia(html, current);
+      if (direct.length) return { url: direct[0], referer: current };
+
+      const embed = html.match(/<iframe\b[^>]*src=["'](https?:\/\/[^"']*argon[^"']*\/embed\/([A-Za-z0-9]+)[^"']*)["']/i);
+      if (embed) return this.resolveArgon(embed[2]);
+
+      const dataHref = html.match(/\bdata-href=["']([^"']+)["']/i);
+      if (dataHref) {
+        const next = this.absoluteUrl(this.decodeHtml(dataHref[1]), current);
+        currentReferer = current;
+        current = next;
+        continue;
+      }
+
+      const candidates = this.extractFramesAndCandidates(html, current)
+        .filter((url) =>
+          /codedew\.com\/(?:multiquality|streambeta|watchbeta|zipper|zipcloud)\//i.test(url) ||
+          /argon\.razorshell\.space\/embed\//i.test(url) ||
+          /\.(?:m3u8|mp4|webm)(?:[?#]|$)/i.test(url)
+        );
+
+      if (candidates.length) {
+        currentReferer = current;
+        current = candidates[0];
+        continue;
+      }
+
+      throw new Error("RareAnime: codedew page exposed no playable target");
+    }
+
+    throw new Error("RareAnime: codedew redirect chain is too deep");
+  }
+
   private async resolveMedia(startUrl: string, referer: string): Promise<{ url: string; referer: string }> {
+    if (/codedew\.com\/(?:zipper|multiquality|streambeta|watchbeta|zipcloud)\//i.test(startUrl)) {
+      return this.resolveCodedew(startUrl, referer);
+    }
+
     const queue: Array<{ url: string; referer: string; depth: number }> = [
       { url: startUrl, referer, depth: 0 },
     ];
@@ -979,6 +1300,17 @@ class Provider {
       if (visited[item.url] || item.depth > 7) continue;
       visited[item.url] = true;
 
+      if (this.isNoiseUrl(item.url)) continue;
+
+      if (/codedew\.com\/(?:zipper|multiquality|streambeta|watchbeta|zipcloud)\//i.test(item.url)) {
+        try {
+          return await this.resolveCodedew(item.url, item.referer);
+        } catch (error) {
+          console.error("RareAnime: codedew resolution failed for " + item.url, error);
+          continue;
+        }
+      }
+
       if (/\.(?:m3u8|mp4|mkv|webm)(?:[?#]|$)/i.test(item.url)) {
         return { url: item.url, referer: item.referer };
       }
@@ -986,6 +1318,10 @@ class Provider {
       try {
         const response = await this.request(item.url, item.referer);
         const finalUrl = response.url || item.url;
+
+        if (/codedew\.com\/(?:zipper|multiquality|streambeta|watchbeta|zipcloud)\//i.test(finalUrl)) {
+          return await this.resolveCodedew(finalUrl, item.url);
+        }
 
         if (/\.(?:m3u8|mp4|mkv|webm)(?:[?#]|$)/i.test(finalUrl)) {
           return { url: finalUrl, referer: item.url };
@@ -1086,8 +1422,22 @@ class Provider {
         if (parsed && parsed.links.length) return parsed.links;
       }
 
-      // Some linker pages open the chosen episode directly and expose a
-      // player/iframe without a second episode list.
+      // store.animetoonhindi archive pages are the important special case:
+      // their rows are often just ordered codedew zipper links without
+      // "Episode 01" text. Map the requested episode by document order.
+      const archived = this.archiveLinks(html, finalUrl);
+      if (archived.length >= localNumber) {
+        const chosen = archived[localNumber - 1];
+        console.log(
+          "RareAnime: archive mapped episode " + localNumber +
+          " -> " + chosen.url
+        );
+        return [{
+          name: batchLink.name || chosen.name,
+          url: chosen.url,
+        }];
+      }
+
       const direct = this.extractDirectMedia(html, finalUrl);
       if (direct.length) {
         return direct.map((url) => ({ name: batchLink.name, url }));
