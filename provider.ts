@@ -1109,12 +1109,16 @@ class Provider {
     let body = blob.slice(0, -3).replace(/_/g, "+").replace(/-/g, "/");
     while (body.length % 4 !== 0) body += "=";
 
-    const decoded = Buffer.from(body, "base64").toString("latin1");
+    // Seanime's goja Buffer implementation does not support the Node
+    // "latin1" encoding name. Work with the decoded bytes directly instead;
+    // JuicyCodes only uses the ten ASCII symbols below.
+    const decodedBytes = Uint8Array.from(Buffer.from(body, "base64"));
     const symbols = ["\x60", "%", "-", "+", "*", "$", "!", "_", "^", "="];
     let digits = "";
 
-    for (let i = 0; i < decoded.length; i++) {
-      const index = symbols.indexOf(decoded.charAt(i));
+    for (let i = 0; i < decodedBytes.length; i++) {
+      const ch = String.fromCharCode(decodedBytes[i]);
+      const index = symbols.indexOf(ch);
       if (index < 0) {
         throw new Error("RareAnime: unexpected JuicyCodes symbol");
       }
@@ -1503,12 +1507,29 @@ class Provider {
         );
 
         const resolved = await this.resolveMedia(chosen.url, data.page);
+        const playbackHeaders: Record<string, string> = {
+          Referer: resolved.referer,
+          "User-Agent": USER_AGENT,
+        };
+
+        // Argon HLS is sensitive to the same browser-ish headers used by its
+        // embed page. Preserve them for Seanime/MPV when requesting the
+        // master playlist and its segments.
+        if (resolved.referer.indexOf("argon.razorshell.space") >= 0) {
+          playbackHeaders["Origin"] = "https://argon.razorshell.space";
+          playbackHeaders["Accept"] = "*/*";
+          playbackHeaders["Accept-Language"] = "en-US,en;q=0.9";
+        }
+
+        console.log(
+          "RareAnime: resolved episode " + data.number +
+          " -> " + this.mediaType(resolved.url) +
+          " " + resolved.url
+        );
+
         return {
           server: chosen.name,
-          headers: {
-            Referer: resolved.referer,
-            "User-Agent": USER_AGENT,
-          },
+          headers: playbackHeaders,
           videoSources: [
             {
               url: resolved.url,
