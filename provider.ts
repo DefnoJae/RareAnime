@@ -494,11 +494,50 @@ class Provider {
     return this.stripTags(label) || "Source";
   }
 
+  private isNoiseUrl(url: string): boolean {
+    const lower = (url || "").toLowerCase();
+    return (
+      !/^https?:\/\//i.test(url) ||
+      /(?:facebook\.com|twitter\.com|x\.com|reddit\.com|whatsapp\.com|t\.me|telegram\.)/i.test(lower) ||
+      /(?:\/comment-page-|replytocom=|#respond|\/sharer\/|intent\/tweet|\/submit\?url=)/i.test(lower) ||
+      /(?:wp-login|wp-admin|\/feed\/?$|\/author\/|\/tag\/|\/category\/)/i.test(lower)
+    );
+  }
+
   private isUsefulLink(label: string, url: string): boolean {
+    if (this.isNoiseUrl(url)) return false;
+
     const text = (label + " " + url).toLowerCase();
     if (/\b(?:zip|gofile|mediafire)\b/i.test(text)) return false;
-    return /watch|stream|hubcloud|dlbeta|mega|multi|player|episode|\bep\b/i.test(text) ||
-      !url.startsWith(BASE_URL);
+
+    // Do not treat arbitrary RareAnimes navigation/article links as stream
+    // servers. Those were the reason a Naruto batch link could wander into a
+    // completely unrelated Pokemon page.
+    if (url.startsWith(BASE_URL)) {
+      return /(?:\/watch|\/stream|\/player|\/redirect)/i.test(url);
+    }
+
+    return /watch|stream|hubcloud|dlbeta|mega|multi|player|episode|\bep\b|codedew|animetoonhindi/i.test(text);
+  }
+
+  private targetBaseFromPage(pageUrl: string): string {
+    return this.baseTitle(this.slugTitle(pageUrl));
+  }
+
+  private isMatchingInternalRedirect(targetPageUrl: string, finalUrl: string): boolean {
+    if (!finalUrl.startsWith(BASE_URL)) return true;
+
+    const targetBase = this.targetBaseFromPage(targetPageUrl);
+    const finalBase = this.baseTitle(this.slugTitle(finalUrl));
+    if (!targetBase || !finalBase) return true;
+
+    const targetWords = this.words(targetBase);
+    const finalWords = this.words(finalBase);
+    const hits = targetWords.filter((word) => finalWords.indexOf(word) >= 0).length;
+    const recall = targetWords.length ? hits / targetWords.length : 0;
+    const precision = finalWords.length ? hits / finalWords.length : 0;
+
+    return targetBase === finalBase || (recall >= 0.8 && precision >= 0.6);
   }
 
   private extractLinks(block: string, baseUrl: string): RareLink[] {
@@ -685,15 +724,41 @@ class Provider {
     return match ? parseInt(match[1], 10) : 0;
   }
 
-  private async episodesFromIndex(indexUrl: string, referer: string, offset: number): Promise<EpisodeDetails[]> {
+  private async episodesFromIndex(
+    indexUrl: string,
+    referer: string,
+    offset: number,
+    expectedCount: number = 0,
+  ): Promise<EpisodeDetails[]> {
     try {
       const response = await this.request(indexUrl, referer);
       const finalUrl = response.url || indexUrl;
       const html = await Promise.resolve(response.text());
 
+      if (!this.isMatchingInternalRedirect(referer, finalUrl)) {
+        console.log(
+          "RareAnime: rejected unrelated index redirect " + finalUrl +
+          " for " + referer
+        );
+        return [];
+      }
+
       let episodes = this.extractEpisodes(html, finalUrl, offset);
       if (!episodes.length) {
         episodes = this.extractEpisodeAnchors(html, finalUrl, offset);
+      }
+
+      // A season page that declares 26 episodes must not be replaced by a
+      // single accidental match from an unrelated index page. If an external
+      // index does not yield a credible full list, fall back to placeholders
+      // 1..N using the original season-level links.
+      if (expectedCount > 1 && episodes.length > 0 && episodes.length !== expectedCount) {
+        console.log(
+          "RareAnime: rejected incomplete index list count=" + episodes.length +
+          " expected=" + expectedCount +
+          " from " + finalUrl
+        );
+        return [];
       }
 
       if (episodes.length) {
@@ -735,7 +800,7 @@ class Provider {
       }
 
       for (const link of ordered.slice(0, 3)) {
-        episodes = await this.episodesFromIndex(link.url, pageUrl, offset);
+        episodes = await this.episodesFromIndex(link.url, pageUrl, offset, pageCount);
         if (episodes.length) break;
       }
     }
@@ -862,7 +927,19 @@ class Provider {
 
     const add = (raw: string) => {
       const url = this.absoluteUrl(this.decodeScriptUrl(raw), baseUrl);
-      if (!/^https?:\/\//i.test(url) || seen[url]) return;
+      if (!/^https?:\/\//i.test(url) || seen[url] || this.isNoiseUrl(url)) return;
+
+      // Once resolution has left RareAnimes, never crawl back through random
+      // RareAnimes posts/navigation. Only direct media URLs are allowed back
+      // on the source domain.
+      if (
+        url.startsWith(BASE_URL) &&
+        !/\.(?:m3u8|mp4|mkv|webm)(?:[?#]|$)/i.test(url) &&
+        !/(?:\/watch|\/stream|\/player|\/redirect)/i.test(url)
+      ) {
+        return;
+      }
+
       seen[url] = true;
       urls.push(url);
     };
@@ -987,6 +1064,14 @@ class Provider {
       const finalUrl = response.url || batchLink.url;
       const html = await Promise.resolve(response.text());
       const localNumber = data.localNumber || data.number;
+
+      if (!this.isMatchingInternalRedirect(data.page, finalUrl)) {
+        console.log(
+          "RareAnime: rejected unrelated batch redirect " + finalUrl +
+          " for episode " + localNumber
+        );
+        return [];
+      }
 
       let episodes = this.extractEpisodes(html, finalUrl, 0);
       if (!episodes.length) episodes = this.extractEpisodeAnchors(html, finalUrl, 0);
