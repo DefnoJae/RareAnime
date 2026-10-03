@@ -1,13 +1,13 @@
 {
   "id": "rareanime",
   "name": "RareAnime by Jae",
-  "version": "0.3.1",
+  "version": "0.3.2",
   "manifestURI": "https://raw.githubusercontent.com/DefnoJae/RareAnime/main/Manifest.json",
   "language": "typescript",
   "type": "onlinestream-provider",
   "description": "RareAnimes online streaming provider for Seanime with season stitching, AnimeToon archive parsing, Codedew/Argon stream resolution, and Seanime-safe JuicyCodes decoding.",
   "author": "Jae",
-  "icon": "https://www.rareanimes.mov/favicon.ico",
+  "icon": "https://raw.githubusercontent.com/DefnoJae/RareAnime/main/assets/icon.png",
   "lang": "en",
   "payloadURI": "https://raw.githubusercontent.com/DefnoJae/RareAnime/main/provider.ts"
 }
