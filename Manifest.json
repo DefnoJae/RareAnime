@@ -1,11 +1,11 @@
 {
   "id": "rareanime",
   "name": "RareAnime by Jae",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "manifestURI": "https://raw.githubusercontent.com/DefnoJae/RareAnime/main/Manifest.json",
   "language": "typescript",
   "type": "onlinestream-provider",
-  "description": "RareAnimes online streaming provider for Seanime. Searches RareAnimes and resolves Hindi/Tamil/Telugu dubbed episode streams from supported watch hosts.",
+  "description": "RareAnimes online streaming provider for Seanime with stricter title matching, multi-season episode aggregation, and batch/index stream resolution.",
   "author": "Jae",
   "icon": "https://www.rareanimes.mov/favicon.ico",
   "lang": "en",
