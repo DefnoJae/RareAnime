@@ -98,6 +98,7 @@ declare const Buffer: any;
 interface RareLink {
   name: string;
   url: string;
+  language?: string;
 }
 
 interface RareEpisodeId {
@@ -135,8 +136,11 @@ const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+const AUDIO_LANGUAGES = ["Hindi", "Tamil", "Telugu", "English", "Japanese", "Malayalam", "Bengali"];
+
 const SERVER_NAMES = [
   "Auto",
+  ...AUDIO_LANGUAGES,
   "WatchMultiQuality",
   "StreamBeta",
   "HubCloud",
@@ -430,11 +434,17 @@ class Provider {
 
     const results: SearchResult[] = [];
 
-    // AniList treats some older long-running shows as one entry while
-    // RareAnimes splits them into Season 1, Season 2, etc. Group those pages
-    // into one provider result so Naruto (220), Shippuden (500), etc. can be
-    // assembled in episode order.
-    if ((options.media.episodeCount || 0) >= 40) {
+    // RareAnimes frequently splits one show into separate season pages.
+    // When AniList/search is asking for the base show (no explicit season),
+    // expose one stitched result and do not also expose Season 1 with the same
+    // title; Seanime can otherwise auto-match the raw S1 row and hide later
+    // seasons even though the collection result is present.
+    const requestedSeason = this.buildTargets(options)
+      .map((target) => this.seasonNumber(target))
+      .filter((season) => season > 0)[0] || 0;
+    let stitchedBase = "";
+
+    if (!requestedSeason) {
       const top = rows[0];
       const sameBase = rows
         .filter((row) => row.baseTitle === top.baseTitle && row.season > 0)
@@ -456,6 +466,7 @@ class Provider {
           target: top.mappedTitle,
           expected: options.media.episodeCount,
         };
+        stitchedBase = top.baseTitle;
 
         results.push({
           id: JSON.stringify(collection),
@@ -467,6 +478,8 @@ class Provider {
     }
 
     for (const row of rows.slice(0, 12)) {
+      if (stitchedBase && row.baseTitle === stitchedBase && row.season > 0) continue;
+      if (requestedSeason && row.season > 0 && row.season !== requestedSeason) continue;
       results.push({
         id: row.url,
         // When the slug base exactly matches one of AniList's titles, expose
@@ -541,6 +554,23 @@ class Provider {
     return targetBase === finalBase || (recall >= 0.8 && precision >= 0.6);
   }
 
+  private languageNear(block: string, index: number): string {
+    const before = this.stripTags(block.slice(Math.max(0, index - 260), index));
+    let best = "";
+    let bestIndex = -1;
+    for (const language of AUDIO_LANGUAGES) {
+      const re = new RegExp("\\b" + language + "\\b", "ig");
+      let match: RegExpExecArray | null;
+      while ((match = re.exec(before)) !== null) {
+        if (match.index >= bestIndex) {
+          best = language;
+          bestIndex = match.index;
+        }
+      }
+    }
+    return best;
+  }
+
   private extractLinks(block: string, baseUrl: string): RareLink[] {
     const links: RareLink[] = [];
     const seen: Record<string, boolean> = {};
@@ -556,6 +586,7 @@ class Provider {
       links.push({
         name: this.normalizeServerName(rawLabel, url),
         url,
+        ...(this.languageNear(block, match.index) ? { language: this.languageNear(block, match.index) } : {}),
       });
     }
 
@@ -1369,9 +1400,20 @@ class Provider {
   }
 
   private orderLinks(links: RareLink[], server: string): RareLink[] {
-    const requested = (server || "Auto").toLowerCase().replace(/\s+/g, "");
+    const requestedRaw = server || "Auto";
+    const requested = requestedRaw.toLowerCase().replace(/\s+/g, "");
+    const requestedLanguage = AUDIO_LANGUAGES.find(
+      (language) => language.toLowerCase() === requested
+    );
 
-    if (requested !== "auto") {
+    let pool = links;
+    if (requestedLanguage) {
+      const exact = links.filter(
+        (link) => (link.language || "").toLowerCase() === requestedLanguage.toLowerCase()
+      );
+      if (!exact.length) return [];
+      pool = exact;
+    } else if (requested !== "auto") {
       return links.filter(
         (link) => link.name.toLowerCase().replace(/\s+/g, "") === requested
       );
@@ -1381,14 +1423,14 @@ class Provider {
     const priority = ["WatchMultiQuality", "StreamBeta", "HubCloud", "WatchNow", "DLBeta", "Mega"];
 
     for (const name of priority) {
-      for (const link of links) {
+      for (const link of pool) {
         if (link.name === name && !ordered.some((item) => item.url === link.url)) {
           ordered.push(link);
         }
       }
     }
 
-    for (const link of links) {
+    for (const link of pool) {
       if (!ordered.some((item) => item.url === link.url)) ordered.push(link);
     }
 
@@ -1528,7 +1570,7 @@ class Provider {
         );
 
         return {
-          server: chosen.name,
+          server: AUDIO_LANGUAGES.indexOf(server) >= 0 ? server : chosen.name,
           headers: playbackHeaders,
           videoSources: [
             {
