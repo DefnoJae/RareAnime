@@ -121,6 +121,8 @@ interface RareSelectionId {
   page: string;
   expected?: number;
   sourceOffset?: number;
+  mediaId?: number;
+  requestedPart?: number;
 }
 
 interface Candidate {
@@ -145,16 +147,11 @@ const USER_AGENT =
 
 const AUDIO_LANGUAGES = ["Hindi", "Tamil", "Telugu", "English", "Japanese", "Malayalam", "Bengali"];
 
-const SERVER_NAMES = [
-  "Auto",
-  ...AUDIO_LANGUAGES,
-  "WatchMultiQuality",
-  "StreamBeta",
-  "HubCloud",
-  "WatchNow",
-  "DLBeta",
-  "Mega",
-];
+// Seanime calls findEpisodeServer once for every entry here, sequentially.
+// RareAnimes often exposes 5+ mirrors for the same file, so advertising every
+// host made each episode wait for several duplicate resolver chains. "Auto"
+// already performs fallback internally and is much faster for first/next load.
+const SERVER_NAMES = ["Auto"];
 
 class Provider {
   private prequelEpisodeCache: Record<number, number> = {};
@@ -297,8 +294,8 @@ class Provider {
   }
 
   private buildQueries(options: SearchOptions): string[] {
-    const targets = this.buildTargets(options);
     const output: string[] = [];
+    const target = (options.query || "").trim();
 
     const add = (value: string) => {
       const clean = value.trim().replace(/\s+/g, " ");
@@ -307,21 +304,26 @@ class Provider {
       }
     };
 
-    for (const target of targets) {
+    if (!target) return output;
+
+    const noPart = target
+      .replace(/\s+(?:part|cour)\s*\d+\s*$/i, "")
+      .trim();
+
+    // Combined-season pages are much more common than dedicated cour pages.
+    // Query the base title first for Part/Cour entries, which saves one whole
+    // WordPress request on the common path.
+    if (noPart && noPart !== target) {
+      add(noPart);
+    } else {
       add(target);
-      const noPart = target
-        .replace(/\s+(?:part|cour)\s*\d+\s*$/i, "")
-        .trim();
-      if (noPart) add(noPart);
-      const noSeason = noPart
-        .replace(/\s+(?:season\s*\d+|\d+(?:st|nd|rd|th)\s+season)\s*$/i, "")
-        .trim();
-      if (noSeason) add(noSeason);
-      const colon = target.indexOf(":");
-      if (colon > 0) add(target.slice(0, colon));
     }
 
-    return output.slice(0, 5);
+    // Keep one exact fallback for unusual sites/posts where the cour is
+    // represented separately. Normal titles therefore make only one request.
+    if (noPart !== target) add(target);
+
+    return output.slice(0, 2);
   }
 
   private scoreCandidate(title: string, url: string, options: SearchOptions): { score: number; mappedTitle: string } {
@@ -518,17 +520,7 @@ class Provider {
     const requestedPart = targets
       .map((target) => this.partNumber(target))
       .filter((part) => part > 0)[0] || 0;
-    let sourceOffset = options.media.absoluteSeasonOffset || 0;
-
-    if (requestedPart > 1 && !sourceOffset) {
-      sourceOffset = await this.prequelEpisodeCount(options.media.id);
-      if (sourceOffset) {
-        console.log(
-          "RareAnime: split-cour media " + options.media.id +
-          " will start after source episode " + sourceOffset
-        );
-      }
-    }
+    const sourceOffset = options.media.absoluteSeasonOffset || 0;
 
     let stitchedBase = "";
 
@@ -572,6 +564,8 @@ class Provider {
         page: row.url,
         expected: options.media.episodeCount,
         sourceOffset,
+        mediaId: options.media.id,
+        requestedPart,
       };
       results.push({
         id: JSON.stringify(selection),
@@ -592,7 +586,7 @@ class Provider {
 
   private normalizeServerName(label: string, url: string = ""): string {
     const value = (this.stripTags(label) + " " + url).replace(/\s+/g, "").toLowerCase();
-    if (value.indexOf("watchmulti") >= 0) return "WatchMultiQuality";
+    if (value.indexOf("watchmulti") >= 0 || value.indexOf("watchmultquality") >= 0) return "WatchMultiQuality";
     if (value.indexOf("streambeta") >= 0) return "StreamBeta";
     if (value.indexOf("hubcloud") >= 0) return "HubCloud";
     if (value.indexOf("watchnow") >= 0) return "WatchNow";
@@ -1087,7 +1081,18 @@ class Provider {
       }
 
       const expected = selection.expected || 0;
-      const sourceOffset = selection.sourceOffset || 0;
+      let sourceOffset = selection.sourceOffset || 0;
+
+      if ((selection.requestedPart || 0) > 1 && !sourceOffset && selection.mediaId) {
+        sourceOffset = await this.prequelEpisodeCount(selection.mediaId);
+        if (sourceOffset) {
+          console.log(
+            "RareAnime: split-cour media " + selection.mediaId +
+            " will start after source episode " + sourceOffset
+          );
+        }
+      }
+
       let episodes = result.episodes.slice();
 
       // Only apply a cour offset when the RareAnimes page is actually a
@@ -1533,15 +1538,20 @@ class Provider {
       (language) => language.toLowerCase() === requested
     );
 
-    let pool = links;
+    const canonicalLinks = links.map((link) => ({
+      ...link,
+      name: this.normalizeServerName(link.name, link.url),
+    }));
+
+    let pool = canonicalLinks;
     if (requestedLanguage) {
-      const exact = links.filter(
+      const exact = canonicalLinks.filter(
         (link) => (link.language || "").toLowerCase() === requestedLanguage.toLowerCase()
       );
       if (!exact.length) return [];
       pool = exact;
     } else if (requested !== "auto") {
-      return links.filter(
+      return canonicalLinks.filter(
         (link) => link.name.toLowerCase().replace(/\s+/g, "") === requested
       );
     }
