@@ -399,6 +399,18 @@ class Provider {
       if (/\/(?:category|tag|author|page)\//i.test(url)) continue;
 
       const slugTitle = this.slugTitle(url);
+      const candidateText = this.normalizeTitle((rawTitle || "") + " " + slugTitle);
+      const mediaFormat = (options.media.format || "").toUpperCase();
+      const targetText = this.normalizeTitle(this.buildTargets(options).join(" "));
+      const candidateLooksMovie = /\b(?:movie|film|theatrical|special)\b/i.test(candidateText);
+      const targetLooksMovie =
+        mediaFormat === "MOVIE" ||
+        /\b(?:movie|film|theatrical|special)\b/i.test(targetText);
+
+      if (candidateLooksMovie && !targetLooksMovie) {
+        continue;
+      }
+
       const scoring = this.scoreCandidate(rawTitle || slugTitle, url, options);
       if (scoring.score < 55) continue;
 
