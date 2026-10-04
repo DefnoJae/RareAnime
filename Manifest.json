@@ -1,7 +1,7 @@
 {
   "id": "rareanime",
   "name": "RareAnime by Jae",
-  "version": "0.3.7",
+  "version": "0.3.8",
   "manifestURI": "https://raw.githubusercontent.com/DefnoJae/RareAnime/main/Manifest.json",
   "language": "typescript",
   "type": "onlinestream-provider",
