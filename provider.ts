@@ -295,7 +295,11 @@ class Provider {
 
   private buildQueries(options: SearchOptions): string[] {
     const output: string[] = [];
-    const target = (options.query || "").trim();
+    // RareAnimes titles are overwhelmingly English. Seanime normally calls a
+    // provider with romaji first and then English, so preferring AniList's
+    // English title lets the first provider call hit the site title directly.
+    const target = (options.media.englishTitle || options.query || "").trim();
+    const callerQuery = (options.query || "").trim();
 
     const add = (value: string) => {
       const clean = value.trim().replace(/\s+/g, " ");
@@ -311,19 +315,18 @@ class Provider {
       .trim();
 
     // Combined-season pages are much more common than dedicated cour pages.
-    // Query the base title first for Part/Cour entries, which saves one whole
-    // WordPress request on the common path.
-    if (noPart && noPart !== target) {
-      add(noPart);
-    } else {
-      add(target);
-    }
+    // Query the base title first for Part/Cour entries.
+    if (noPart && noPart !== target) add(noPart);
+    else add(target);
 
-    // Keep one exact fallback for unusual sites/posts where the cour is
-    // represented separately. Normal titles therefore make only one request.
+    // Exact English title is the first fallback for dedicated cour posts.
     if (noPart !== target) add(target);
 
-    return output.slice(0, 2);
+    // Romaji/caller query is only a final fallback when it is genuinely
+    // different. A strong English match exits the search loop before this.
+    if (callerQuery && callerQuery.toLowerCase() !== target.toLowerCase()) add(callerQuery);
+
+    return output.slice(0, 3);
   }
 
   private scoreCandidate(title: string, url: string, options: SearchOptions): { score: number; mappedTitle: string } {
@@ -1075,22 +1078,32 @@ class Provider {
 
     const selection = this.parseSelectionId(id);
     if (selection) {
-      const result = await this.findPageEpisodes(selection.page, 0);
+      const needsOffset =
+        (selection.requestedPart || 0) > 1 &&
+        !(selection.sourceOffset || 0) &&
+        !!selection.mediaId;
+
+      // For split cours, fetch the RareAnimes page and the tiny AniList
+      // relation lookup at the same time instead of adding their latencies.
+      const [result, resolvedOffset] = await Promise.all([
+        this.findPageEpisodes(selection.page, 0),
+        needsOffset
+          ? this.prequelEpisodeCount(selection.mediaId as number)
+          : Promise.resolve(selection.sourceOffset || 0),
+      ]);
+
       if (!result.episodes.length) {
         throw new Error("RareAnime: no playable episode links were found on this page");
       }
 
       const expected = selection.expected || 0;
-      let sourceOffset = selection.sourceOffset || 0;
+      const sourceOffset = resolvedOffset || selection.sourceOffset || 0;
 
-      if ((selection.requestedPart || 0) > 1 && !sourceOffset && selection.mediaId) {
-        sourceOffset = await this.prequelEpisodeCount(selection.mediaId);
-        if (sourceOffset) {
-          console.log(
-            "RareAnime: split-cour media " + selection.mediaId +
-            " will start after source episode " + sourceOffset
-          );
-        }
+      if (sourceOffset && needsOffset) {
+        console.log(
+          "RareAnime: split-cour media " + selection.mediaId +
+          " will start after source episode " + sourceOffset
+        );
       }
 
       let episodes = result.episodes.slice();
