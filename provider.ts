@@ -771,13 +771,20 @@ class Provider {
       });
     }
 
-    const episodes: EpisodeDetails[] = [];
-    const seen: Record<number, boolean> = {};
+    // RareAnimes sometimes publishes the same episode twice: first as
+    // separate Hindi/Tamil/Telugu files, then as "Untouched CR (Multi Audio)".
+    // Prefer the untouched multi-audio file. Seanime's player can inspect the
+    // embedded audio tracks, which makes its normal Audio button show the
+    // available dub languages without resolving every dub as a separate
+    // provider server (and without bringing back the v0.3.6 slowdown).
+    const chosen: Record<number, {
+      episode: EpisodeDetails;
+      multiAudio: boolean;
+      title: string;
+    }> = {};
 
     for (let i = 0; i < starts.length; i++) {
       const current = starts[i];
-      if (seen[current.number]) continue;
-
       const nextIndex = i + 1 < starts.length
         ? starts[i + 1].index
         : Math.min(html.length, current.index + 9000);
@@ -785,19 +792,43 @@ class Provider {
       const links = this.extractLinks(block, pageUrl);
       if (!links.length) continue;
 
+      const blockText = this.stripTags(block.slice(0, 700));
+      const multiAudio = /\bmulti\s*[- ]?audio\b|\buntouched\s*cr\b/i.test(
+        current.title + " " + blockText
+      );
+      const existing = chosen[current.number];
+
+      if (existing && (!multiAudio || existing.multiAudio)) continue;
+
+      const displayTitle = multiAudio && existing?.title
+        ? existing.title
+        : current.title;
       const globalNumber = offset + current.number;
-      episodes.push(this.episodePayload(
-        pageUrl,
-        globalNumber,
-        current.number,
-        current.title,
-        links,
-        false,
-      ));
-      seen[current.number] = true;
+      chosen[current.number] = {
+        episode: this.episodePayload(
+          pageUrl,
+          globalNumber,
+          current.number,
+          displayTitle,
+          links,
+          false,
+        ),
+        multiAudio,
+        title: displayTitle,
+      };
+
+      if (multiAudio) {
+        console.log(
+          "RareAnime: episode " + current.number +
+          " prefers untouched multi-audio source for player audio-track selection"
+        );
+      }
     }
 
-    return episodes.sort((a, b) => a.number - b.number);
+    return Object.keys(chosen)
+      .map((key) => parseInt(key, 10))
+      .sort((a, b) => a - b)
+      .map((number) => chosen[number].episode);
   }
 
   private extractEpisodeAnchors(html: string, pageUrl: string, offset: number = 0): EpisodeDetails[] {
