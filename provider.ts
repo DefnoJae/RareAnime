@@ -26,6 +26,7 @@ declare interface Media {
   englishTitle?: string;
   romajiTitle?: string;
   episodeCount?: number;
+  absoluteSeasonOffset?: number;
   synonyms: string[];
   isAdult: boolean;
 }
@@ -116,6 +117,12 @@ interface RareCollectionId {
   expected?: number;
 }
 
+interface RareSelectionId {
+  page: string;
+  expected?: number;
+  sourceOffset?: number;
+}
+
 interface Candidate {
   title: string;
   url: string;
@@ -150,6 +157,8 @@ const SERVER_NAMES = [
 ];
 
 class Provider {
+  private prequelEpisodeCache: Record<number, number> = {};
+
   getSettings(): Settings {
     return {
       episodeServers: SERVER_NAMES,
@@ -247,9 +256,15 @@ class Provider {
     return match ? parseInt(match[1], 10) : 0;
   }
 
+  private partNumber(value: string): number {
+    const normalized = this.normalizeTitle(value);
+    const match = normalized.match(/\b(?:part|cour)\s*0*(\d{1,3})\b/i);
+    return match ? parseInt(match[1], 10) : 0;
+  }
+
   private baseTitle(value: string): string {
     return this.normalizeTitle(value)
-      .replace(/\b(?:season|part)\s*0*\d{1,3}\b/g, " ")
+      .replace(/\b(?:season|part|cour)\s*0*\d{1,3}\b/g, " ")
       .replace(/\b\d{1,3}(?:st|nd|rd|th)\s+season\b/g, " ")
       .replace(/\bs\s*0*\d{1,3}\b/g, " ")
       .replace(/\b(?:hindi|tamil|telugu|malayalam|bengali|english|japanese)\b/g, " ")
@@ -294,7 +309,11 @@ class Provider {
 
     for (const target of targets) {
       add(target);
-      const noSeason = target
+      const noPart = target
+        .replace(/\s+(?:part|cour)\s*\d+\s*$/i, "")
+        .trim();
+      if (noPart) add(noPart);
+      const noSeason = noPart
         .replace(/\s+(?:season\s*\d+|\d+(?:st|nd|rd|th)\s+season)\s*$/i, "")
         .trim();
       if (noSeason) add(noSeason);
@@ -397,6 +416,59 @@ class Provider {
     return null;
   }
 
+  private parseSelectionId(id: string): RareSelectionId | null {
+    try {
+      const parsed = JSON.parse(id);
+      if (parsed && typeof parsed.page === "string" && !Array.isArray(parsed.links)) {
+        return parsed as RareSelectionId;
+      }
+    } catch (_error) {}
+    return null;
+  }
+
+  private async prequelEpisodeCount(mediaId: number): Promise<number> {
+    if (!mediaId) return 0;
+    if (Object.prototype.hasOwnProperty.call(this.prequelEpisodeCache, mediaId)) {
+      return this.prequelEpisodeCache[mediaId];
+    }
+
+    try {
+      // Seanime's provider.d.ts declares absoluteSeasonOffset, but current
+      // runtimes do not reliably send it. For split-cour AniList entries,
+      // make one tiny metadata request so a combined RareAnimes season page
+      // can be sliced at the real prequel episode count (e.g. 11 + 12).
+      const response = await fetch("https://graphql.anilist.co", {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+          "User-Agent": USER_AGENT,
+        },
+        body: JSON.stringify({
+          query: "query ($id: Int) { Media(id: $id, type: ANIME) { relations { edges { relationType node { id episodes format } } } } }",
+          variables: { id: mediaId },
+        }),
+        redirect: "follow",
+        timeout: 15,
+      });
+
+      if (!response.ok) throw new Error("HTTP " + response.status);
+      const payload = await Promise.resolve(response.json<any>());
+      const edges = payload?.data?.Media?.relations?.edges || [];
+      const counts = edges
+        .filter((edge: any) => edge?.relationType === "PREQUEL" && (edge?.node?.episodes || 0) > 0)
+        .map((edge: any) => Number(edge.node.episodes))
+        .filter((count: number) => count > 0);
+      const count = counts.length ? Math.max.apply(null, counts) : 0;
+      this.prequelEpisodeCache[mediaId] = count;
+      return count;
+    } catch (error) {
+      console.error("RareAnime: could not resolve split-cour prequel offset", error);
+      this.prequelEpisodeCache[mediaId] = 0;
+      return 0;
+    }
+  }
+
   async search(options: SearchOptions): Promise<SearchResult[]> {
     const queries = this.buildQueries(options);
     const all: Record<string, Candidate> = {};
@@ -439,12 +511,28 @@ class Provider {
     // expose one stitched result and do not also expose Season 1 with the same
     // title; Seanime can otherwise auto-match the raw S1 row and hide later
     // seasons even though the collection result is present.
-    const requestedSeason = this.buildTargets(options)
+    const targets = this.buildTargets(options);
+    const requestedSeason = targets
       .map((target) => this.seasonNumber(target))
       .filter((season) => season > 0)[0] || 0;
+    const requestedPart = targets
+      .map((target) => this.partNumber(target))
+      .filter((part) => part > 0)[0] || 0;
+    let sourceOffset = options.media.absoluteSeasonOffset || 0;
+
+    if (requestedPart > 1 && !sourceOffset) {
+      sourceOffset = await this.prequelEpisodeCount(options.media.id);
+      if (sourceOffset) {
+        console.log(
+          "RareAnime: split-cour media " + options.media.id +
+          " will start after source episode " + sourceOffset
+        );
+      }
+    }
+
     let stitchedBase = "";
 
-    if (!requestedSeason) {
+    if (!requestedSeason && requestedPart <= 1) {
       const top = rows[0];
       const sameBase = rows
         .filter((row) => row.baseTitle === top.baseTitle && row.season > 0)
@@ -480,8 +568,13 @@ class Provider {
     for (const row of rows.slice(0, 12)) {
       if (stitchedBase && row.baseTitle === stitchedBase && row.season > 0) continue;
       if (requestedSeason && row.season > 0 && row.season !== requestedSeason) continue;
+      const selection: RareSelectionId = {
+        page: row.url,
+        expected: options.media.episodeCount,
+        sourceOffset,
+      };
       results.push({
-        id: row.url,
+        id: JSON.stringify(selection),
         // When the slug base exactly matches one of AniList's titles, expose
         // that AniList title to Seanime. Seanime performs its own Levenshtein
         // matching on this field, so this avoids "Naruto" being auto-matched
@@ -984,6 +1077,40 @@ class Provider {
       }
 
       return all.sort((a, b) => a.number - b.number);
+    }
+
+    const selection = this.parseSelectionId(id);
+    if (selection) {
+      const result = await this.findPageEpisodes(selection.page, 0);
+      if (!result.episodes.length) {
+        throw new Error("RareAnime: no playable episode links were found on this page");
+      }
+
+      const expected = selection.expected || 0;
+      const sourceOffset = selection.sourceOffset || 0;
+      let episodes = result.episodes.slice();
+
+      // Only apply a cour offset when the RareAnimes page is actually a
+      // combined season. If the site has a dedicated Part/Cour page whose
+      // episode count already fits AniList, leave its local 1..N numbering.
+      if (sourceOffset > 0 && (!expected || result.localCount > expected)) {
+        episodes = episodes.filter((episode) => {
+          const parsed = this.parseEpisodeId(episode.id);
+          const local = parsed?.localNumber || parsed?.number || episode.number;
+          return local > sourceOffset && (!expected || local <= sourceOffset + expected);
+        });
+      } else if (expected > 0 && episodes.length > expected) {
+        episodes = episodes.slice(0, expected);
+      }
+
+      if (!episodes.length) {
+        throw new Error("RareAnime: the matched page did not contain this cour's episode range");
+      }
+
+      return episodes.map((episode, index) => ({
+        ...episode,
+        number: index + 1,
+      }));
     }
 
     const pageUrl = id.startsWith("http") ? id : this.absoluteUrl(id, BASE_URL);
