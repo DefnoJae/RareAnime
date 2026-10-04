@@ -145,16 +145,25 @@ const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
   "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
-const AUDIO_LANGUAGES = ["Hindi", "Tamil", "Telugu", "English", "Japanese", "Malayalam", "Bengali"];
+const AUDIO_LANGUAGES = ["Hindi", "Tamil", "Telugu", "English", "Malayalam", "Bengali"];
+const SOURCE_SERVER_NAMES = [
+  "WatchMultiQuality",
+  "StreamBeta",
+  "HubCloud",
+  "WatchNow",
+  "DLBeta",
+  "Mega",
+];
 
-// Seanime calls findEpisodeServer once for every entry here, sequentially.
-// RareAnimes often exposes 5+ mirrors for the same file, so advertising every
-// host made each episode wait for several duplicate resolver chains. "Auto"
-// already performs fallback internally and is much faster for first/next load.
-const SERVER_NAMES = ["Auto"];
+// Seanime-visible choices are audio languages, not RareAnimes mirror hosts.
+// The first Auto call primes all languages in parallel; Seanime's subsequent
+// per-language calls are served from the in-memory episode cache.
+const SERVER_NAMES = ["Auto", ...AUDIO_LANGUAGES];
 
 class Provider {
   private prequelEpisodeCache: Record<number, number> = {};
+  private searchCache: Record<string, { expires: number; results: SearchResult[] }> = {};
+  private episodeServerCache: Record<string, { expires: number; servers: Record<string, EpisodeServer> }> = {};
 
   getSettings(): Settings {
     return {
@@ -475,6 +484,17 @@ class Provider {
   }
 
   async search(options: SearchOptions): Promise<SearchResult[]> {
+    const cacheKey = [
+      options.media.id,
+      options.media.englishTitle || "",
+      options.media.episodeCount || 0,
+      options.year || 0,
+    ].join("|");
+    const cached = this.searchCache[cacheKey];
+    if (cached && cached.expires > Date.now()) {
+      return cached.results;
+    }
+
     const queries = this.buildQueries(options);
     const all: Record<string, Candidate> = {};
 
@@ -507,7 +527,13 @@ class Provider {
         return 0;
       });
 
-    if (!rows.length) return [];
+    if (!rows.length) {
+      this.searchCache[cacheKey] = {
+        expires: Date.now() + 60 * 1000,
+        results: [],
+      };
+      return [];
+    }
 
     const results: SearchResult[] = [];
 
@@ -584,6 +610,10 @@ class Provider {
       });
     }
 
+    this.searchCache[cacheKey] = {
+      expires: Date.now() + 5 * 60 * 1000,
+      results,
+    };
     return results;
   }
 
@@ -771,20 +801,16 @@ class Provider {
       });
     }
 
-    // RareAnimes sometimes publishes the same episode twice: first as
-    // separate Hindi/Tamil/Telugu files, then as "Untouched CR (Multi Audio)".
-    // Prefer the untouched multi-audio file. Seanime's player can inspect the
-    // embedded audio tracks, which makes its normal Audio button show the
-    // available dub languages without resolving every dub as a separate
-    // provider server (and without bringing back the v0.3.6 slowdown).
-    const chosen: Record<number, {
-      episode: EpisodeDetails;
-      multiAudio: boolean;
-      title: string;
-    }> = {};
+    const episodes: EpisodeDetails[] = [];
+    const seen: Record<number, boolean> = {};
 
     for (let i = 0; i < starts.length; i++) {
       const current = starts[i];
+      // The first occurrence is the language-separated source block. A later
+      // duplicate labelled "Untouched ... Multi Audio" resolves to a direct
+      // MKV, which Seanime's browser HLS audio picker cannot inspect.
+      if (seen[current.number]) continue;
+
       const nextIndex = i + 1 < starts.length
         ? starts[i + 1].index
         : Math.min(html.length, current.index + 9000);
@@ -792,43 +818,19 @@ class Provider {
       const links = this.extractLinks(block, pageUrl);
       if (!links.length) continue;
 
-      const blockText = this.stripTags(block.slice(0, 700));
-      const multiAudio = /\bmulti\s*[- ]?audio\b|\buntouched\s*cr\b/i.test(
-        current.title + " " + blockText
-      );
-      const existing = chosen[current.number];
-
-      if (existing && (!multiAudio || existing.multiAudio)) continue;
-
-      const displayTitle = multiAudio && existing?.title
-        ? existing.title
-        : current.title;
       const globalNumber = offset + current.number;
-      chosen[current.number] = {
-        episode: this.episodePayload(
-          pageUrl,
-          globalNumber,
-          current.number,
-          displayTitle,
-          links,
-          false,
-        ),
-        multiAudio,
-        title: displayTitle,
-      };
-
-      if (multiAudio) {
-        console.log(
-          "RareAnime: episode " + current.number +
-          " prefers untouched multi-audio source for player audio-track selection"
-        );
-      }
+      episodes.push(this.episodePayload(
+        pageUrl,
+        globalNumber,
+        current.number,
+        current.title,
+        links,
+        false,
+      ));
+      seen[current.number] = true;
     }
 
-    return Object.keys(chosen)
-      .map((key) => parseInt(key, 10))
-      .sort((a, b) => a - b)
-      .map((number) => chosen[number].episode);
+    return episodes.sort((a, b) => a.number - b.number);
   }
 
   private extractEpisodeAnchors(html: string, pageUrl: string, offset: number = 0): EpisodeDetails[] {
@@ -1022,7 +1024,7 @@ class Provider {
     }
 
     const pageLinks = this.extractLinks(content, pageUrl)
-      .filter((link) => SERVER_NAMES.indexOf(link.name) >= 0 && link.name !== "Auto");
+      .filter((link) => SOURCE_SERVER_NAMES.indexOf(link.name) >= 0);
 
     // Some posts (for example current Naruto S1) only expose one
     // WatchMultiQuality/Mega season button. Follow the external index first.
@@ -1695,23 +1697,29 @@ class Provider {
 
   async findEpisodeServer(episode: EpisodeDetails, server: string): Promise<EpisodeServer> {
     const data = await this.recoverEpisodeData(episode);
-    let candidates = this.orderLinks(data.links, server);
+    const episodeKey = data.page + "|" + (data.localNumber || data.number);
+    const cached = this.episodeServerCache[episodeKey];
 
-    if (!candidates.length) {
+    if (cached && cached.expires > Date.now()) {
+      const hit = cached.servers[server];
+      if (hit) return hit;
       throw new Error("RareAnime: server " + server + " is not available for this episode");
     }
 
+    let links = this.orderLinks(data.links, "Auto");
+
     if (data.batch) {
       const expanded: RareLink[] = [];
-      for (const batchLink of candidates) {
-        const links = await this.linksForBatchEpisode(batchLink, data);
-        for (const link of links) {
+      for (const batchLink of links.slice(0, 3)) {
+        const batchLinks = await this.linksForBatchEpisode(batchLink, data);
+        for (const link of batchLinks) {
           if (!expanded.some((item) => item.url === link.url)) expanded.push(link);
         }
+        if (expanded.length) break;
       }
-      candidates = expanded;
+      links = expanded;
 
-      if (!candidates.length) {
+      if (!links.length) {
         throw new Error(
           "RareAnime: episode " + (data.localNumber || data.number) +
           " was not found inside the batch/index page"
@@ -1719,56 +1727,127 @@ class Provider {
       }
     }
 
-    let lastError: any = null;
+    const canonical = links.map((link) => ({
+      ...link,
+      name: this.normalizeServerName(link.name, link.url),
+    }));
 
-    for (const chosen of candidates) {
-      try {
-        console.log(
-          "RareAnime: resolving episode " + data.number +
-          " server=" + chosen.name +
-          " url=" + chosen.url
-        );
-
-        const resolved = await this.resolveMedia(chosen.url, data.page);
-        const playbackHeaders: Record<string, string> = {
-          Referer: resolved.referer,
-          "User-Agent": USER_AGENT,
-        };
-
-        // Argon HLS is sensitive to the same browser-ish headers used by its
-        // embed page. Preserve them for Seanime/MPV when requesting the
-        // master playlist and its segments.
-        if (resolved.referer.indexOf("argon.razorshell.space") >= 0) {
-          playbackHeaders["Origin"] = "https://argon.razorshell.space";
-          playbackHeaders["Accept"] = "*/*";
-          playbackHeaders["Accept-Language"] = "en-US,en;q=0.9";
-        }
-
-        console.log(
-          "RareAnime: resolved episode " + data.number +
-          " -> " + this.mediaType(resolved.url) +
-          " " + resolved.url
-        );
-
-        return {
-          server: AUDIO_LANGUAGES.indexOf(server) >= 0 ? server : chosen.name,
-          headers: playbackHeaders,
-          videoSources: [
-            {
-              url: resolved.url,
-              type: this.mediaType(resolved.url),
-              quality: "auto",
-              label: chosen.name,
-              subtitles: [],
-            },
-          ],
-        };
-      } catch (error) {
-        lastError = error;
-        console.error("RareAnime: source failed for " + chosen.url, error);
+    const byLanguage: Record<string, RareLink[]> = {};
+    const unlabeled: RareLink[] = [];
+    for (const link of canonical) {
+      const language = AUDIO_LANGUAGES.find(
+        (item) => item.toLowerCase() === (link.language || "").toLowerCase()
+      );
+      if (language) {
+        if (!byLanguage[language]) byLanguage[language] = [];
+        byLanguage[language].push(link);
+      } else {
+        unlabeled.push(link);
       }
     }
 
-    throw lastError || new Error("RareAnime: no playable source was resolved");
+    const priority = ["WatchMultiQuality", "StreamBeta", "HubCloud", "WatchNow", "DLBeta", "Mega"];
+    const sortLinks = (items: RareLink[]) => items.slice().sort((a, b) => {
+      const ai = priority.indexOf(a.name);
+      const bi = priority.indexOf(b.name);
+      return (ai < 0 ? 999 : ai) - (bi < 0 ? 999 : bi);
+    });
+
+    const resolveOne = async (items: RareLink[], label: string): Promise<EpisodeServer | null> => {
+      let lastError: any = null;
+      for (const chosen of sortLinks(items)) {
+        try {
+          console.log(
+            "RareAnime: resolving episode " + data.number +
+            " audio=" + label +
+            " server=" + chosen.name +
+            " url=" + chosen.url
+          );
+
+          const resolved = await this.resolveMedia(chosen.url, data.page);
+          const playbackHeaders: Record<string, string> = {
+            Referer: resolved.referer,
+            "User-Agent": USER_AGENT,
+          };
+
+          if (resolved.referer.indexOf("argon.razorshell.space") >= 0) {
+            playbackHeaders["Origin"] = "https://argon.razorshell.space";
+            playbackHeaders["Accept"] = "*/*";
+            playbackHeaders["Accept-Language"] = "en-US,en;q=0.9";
+          }
+
+          console.log(
+            "RareAnime: resolved episode " + data.number +
+            " audio=" + label +
+            " -> " + this.mediaType(resolved.url) +
+            " " + resolved.url
+          );
+
+          return {
+            server: label,
+            headers: playbackHeaders,
+            videoSources: [{
+              url: resolved.url,
+              type: this.mediaType(resolved.url),
+              quality: "auto",
+              label: label === "Auto" ? chosen.name : label + " Dub",
+              subtitles: [],
+            }],
+          };
+        } catch (error) {
+          lastError = error;
+          console.error("RareAnime: source failed for " + chosen.url, error);
+        }
+      }
+
+      if (lastError) {
+        console.error("RareAnime: no playable " + label + " source", lastError);
+      }
+      return null;
+    };
+
+    const languageNames = AUDIO_LANGUAGES.filter((language) => !!byLanguage[language]?.length);
+    const resolvedLanguages = await Promise.all(
+      languageNames.map(async (language) => ({
+        language,
+        result: await resolveOne(byLanguage[language], language),
+      }))
+    );
+
+    const servers: Record<string, EpisodeServer> = {};
+    for (const item of resolvedLanguages) {
+      if (item.result) servers[item.language] = item.result;
+    }
+
+    // If language tagging was unavailable, resolve the normal Auto fallback.
+    // Otherwise Auto aliases the first successfully resolved language, with
+    // Hindi preferred because RareAnimes is primarily a Hindi-dub catalogue.
+    if (!Object.keys(servers).length) {
+      const auto = await resolveOne(unlabeled.length ? unlabeled : canonical, "Auto");
+      if (auto) servers.Auto = auto;
+    } else {
+      const preferred =
+        servers.Hindi ||
+        servers.English ||
+        servers.Tamil ||
+        servers.Telugu ||
+        servers[Object.keys(servers)[0]];
+      if (preferred) {
+        servers.Auto = {
+          ...preferred,
+          server: "Auto",
+        };
+      }
+    }
+
+    this.episodeServerCache[episodeKey] = {
+      expires: Date.now() + 5 * 60 * 1000,
+      servers,
+    };
+
+    const result = servers[server];
+    if (result) return result;
+
+    throw new Error("RareAnime: server " + server + " is not available for this episode");
   }
 }
