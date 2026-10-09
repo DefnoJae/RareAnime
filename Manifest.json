@@ -8,6 +8,6 @@
   "description": "RareAnimes online streaming provider for Seanime with season stitching, AnimeToon archive parsing, Codedew/Argon stream resolution, and Seanime-safe JuicyCodes decoding.",
   "author": "Jae",
   "icon": "https://raw.githubusercontent.com/DefnoJae/RareAnime/main/assets/icon-v0.3.3.png",
-  "lang": "en",
+  "lang": "in",
   "payloadURI": "https://raw.githubusercontent.com/DefnoJae/RareAnime/main/provider.ts"
 }
