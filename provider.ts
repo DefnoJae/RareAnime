@@ -392,11 +392,31 @@ class Provider {
     let match: RegExpExecArray | null;
 
     while ((match = anchor.exec(html)) !== null) {
-      const url = this.absoluteUrl(match[1], BASE_URL);
+      let url = this.absoluteUrl(match[1], BASE_URL);
       const rawTitle = this.stripTags(match[2]);
+
+      // RareAnimes now serves newer posts at the site root as well as under
+      // /hindi/. Older versions of this provider only accepted /hindi/ links,
+      // which made valid new posts disappear from WordPress search results.
+      // Normalize the bare domain too because the site uses both host forms.
+      url = url.replace(/^https?:\\/\\/rareanimes\\.mov/i, BASE_URL);
       if (!url.startsWith(BASE_URL)) continue;
-      if (!/\/hindi\//i.test(url)) continue;
-      if (/\/(?:category|tag|author|page)\//i.test(url)) continue;
+
+      const relative = url
+        .slice(BASE_URL.length)
+        .split(/[?#]/)[0]
+        .replace(/^\\/+|\\/+$/g, "");
+
+      if (!relative) continue;
+      if (/^(?:home|hindi|wp-admin|wp-login|wp-content|wp-json)(?:\\/|$)/i.test(relative) && !/^hindi\\/[^/]+\\/?$/i.test(relative)) continue;
+      if (/(?:^|\\/)(?:category|tag|author|page|feed)(?:\\/|$)/i.test(relative)) continue;
+      if (/^(?:privacy-policy|contact-us|cookie-policy|disclaimer|terms|t-c|request-shows|dead-link-report|dmca)(?:\\/|$)/i.test(relative)) continue;
+
+      // A content post is either the legacy /hindi/<slug>/ form or the newer
+      // root-level /<slug>/ form. Ignore deeper navigation/archive paths.
+      const isLegacyPost = /^hindi\\/[^/]+\\/?$/i.test(relative);
+      const isRootPost = /^[^/]+\\/?$/i.test(relative);
+      if (!isLegacyPost && !isRootPost) continue;
 
       const slugTitle = this.slugTitle(url);
       const candidateText = this.normalizeTitle((rawTitle || "") + " " + slugTitle);
@@ -424,8 +444,16 @@ class Provider {
         mappedTitle: scoring.mappedTitle,
       };
 
-      if (!found[url] || candidate.score > found[url].score) {
-        found[url] = candidate;
+      const dedupeKey = candidate.slugTitle || url;
+      const existing = found[dedupeKey];
+      const preferLegacy =
+        existing &&
+        candidate.score === existing.score &&
+        /\\/hindi\\//i.test(candidate.url) &&
+        !/\\/hindi\\//i.test(existing.url);
+
+      if (!existing || candidate.score > existing.score || preferLegacy) {
+        found[dedupeKey] = candidate;
       }
     }
 
